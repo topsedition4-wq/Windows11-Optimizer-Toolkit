@@ -1,0 +1,95 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "App version"
+        required: true
+        default: "0.1.0"
+      publisher:
+        description: "Publisher metadata"
+        required: true
+        default: "Topse Development"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  installer:
+    runs-on: windows-latest
+
+    env:
+      APP_VERSION: ${{ github.event.inputs.version || github.ref_name || '0.1.0' }}
+      APP_PUBLISHER: ${{ github.event.inputs.publisher || 'Topse Development' }}
+      HAS_CODESIGN_PFX: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_BASE64 != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Normalize version
+        shell: pwsh
+        run: |
+          $version = "${env:APP_VERSION}"
+          if ($version.StartsWith("v")) {
+            $version = $version.Substring(1)
+          }
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          PowerShell -ExecutionPolicy Bypass -File .\Build-WindowsInstaller.ps1 -Version "${env:APP_VERSION}" -Publisher "${env:APP_PUBLISHER}"
+
+      - name: Sign installer if certificate secret is configured
+        if: env.HAS_CODESIGN_PFX == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_BASE64 }}
+          WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_PASSWORD }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "windows11optimizer-codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX_BASE64))
+          PowerShell -ExecutionPolicy Bypass -File .\Sign-WindowsInstaller.ps1 -InstallerPath "release\installer\Windows11-Optimizer-Toolkit-Setup-${env:APP_VERSION}.exe" -PfxPath $pfxPath -PfxPasswordEnvironmentVariable "WINDOWS_CODESIGN_PFX_PASSWORD" -UpdateChecksums
+          Remove-Item -LiteralPath $pfxPath -Force
+
+      - name: Require valid signature for tag release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          PowerShell -ExecutionPolicy Bypass -File .\Sign-WindowsInstaller.ps1 -InstallerPath "release\installer\Windows11-Optimizer-Toolkit-Setup-${env:APP_VERSION}.exe" -VerifyOnly
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows11-Optimizer-Toolkit-Setup-${{ env.APP_VERSION }}
+          path: |
+            release/installer/Windows11-Optimizer-Toolkit-Setup-${{ env.APP_VERSION }}.exe
+            release/installer/checksums-sha256.txt
+            release/installer/SILENT-INSTALL.md
+            release/installer/STORE-SIGNING.md
+
+      - name: Publish GitHub Release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${env:GITHUB_REF_NAME}"
+          $installer = "release/installer/Windows11-Optimizer-Toolkit-Setup-${env:APP_VERSION}.exe"
+          $checksums = "release/installer/checksums-sha256.txt"
+          $silent = "release/installer/SILENT-INSTALL.md"
+          $signing = "release/installer/STORE-SIGNING.md"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "Windows11 Optimizer Toolkit ${env:APP_VERSION}" --notes "Windows11 Optimizer Toolkit installer release."
+          }
+          gh release upload $tag $installer $checksums $silent $signing --clobber
